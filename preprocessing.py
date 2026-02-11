@@ -12,9 +12,12 @@ Key updates:
 - Train/test split first; SMOTE applied ONLY on training set
 - Optional majority downsampling + optional train-size cap for laptop feasibility
 """
+#!/bin/bash
 
 import json
 import warnings
+import subprocess
+import zipfile
 from pathlib import Path
 from typing import Tuple, Optional, Dict
 
@@ -34,6 +37,7 @@ class FraudDataPreprocessor:
     """Complete preprocessing pipeline for fraud detection dataset"""
 
     ID_LIKE = {"id", "client_id", "card_id", "merchant_id"}
+    DATASET_ZIP_URL = "https://www.kaggle.com/api/v1/datasets/download/computingvictor/transactions-fraud-datasets"
 
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
@@ -43,6 +47,63 @@ class FraudDataPreprocessor:
         self.cards: Optional[pd.DataFrame] = None
         self.mcc_codes: Optional[dict] = None
         self.scalers: Dict[str, object] = {}
+
+    @staticmethod
+    def download_dataset_via_curl(download_dir: Optional[Path] = None) -> Path:
+        """
+        Download fraud detection dataset using curl and extract it.
+        
+        Args:
+            download_dir: Directory to download to. Defaults to ~/Downloads
+            
+        Returns:
+            Path to the extracted dataset directory
+        """
+        if download_dir is None:
+            download_dir = Path.home() / "Downloads"
+        
+        download_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = download_dir / "transactions-fraud-datasets.zip"
+        extract_dir = download_dir / "transactions-fraud-datasets"
+        
+        # Only download if not already present
+        if extract_dir.exists():
+            print(f"✓ Dataset already extracted at: {extract_dir}")
+            return extract_dir
+        
+        # Download using curl
+        print("=" * 60)
+        print("DOWNLOADING DATA VIA CURL...")
+        print("=" * 60)
+        print(f"Target: {zip_path}")
+        
+        try:
+            cmd = [
+                "curl", "-L", "-o", str(zip_path),
+                FraudDataPreprocessor.DATASET_ZIP_URL
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode != 0:
+                raise Exception(f"curl failed: {result.stderr}")
+            
+            if not zip_path.exists():
+                raise FileNotFoundError(f"Download did not create {zip_path}")
+            
+            print(f"✓ Download successful ({zip_path.stat().st_size / (1024**2):.1f} MB)")
+            
+            # Extract the zip
+            print("Extracting dataset...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            
+            print(f"✓ Extraction complete: {extract_dir}")
+            return extract_dir
+            
+        except subprocess.TimeoutExpired:
+            raise Exception("Download timed out (5 minutes exceeded)")
+        except Exception as e:
+            raise Exception(f"Failed to download dataset: {str(e)}")
 
     def load_data(self) -> None:
         print("=" * 60)
@@ -64,21 +125,32 @@ class FraudDataPreprocessor:
 
         labels_path = self.data_dir / "train_fraud_labels.json"
         with open(labels_path, "r") as f:
-            self.labels = json.load(f)
+            labels_data = json.load(f)
+        
+        # Extract the "target" dictionary (structure: {"target": {tx_id: "Yes"/"No", ...}})
+        self.labels = labels_data.get("target", labels_data)
         print(f"✓ Labels loaded: {len(self.labels)} transactions")
+        
+        # Count fraud vs legitimate
+        fraud_count = sum(1 for v in self.labels.values() if v == "Yes")
+        print(f"   - Fraud cases: {fraud_count}")
+        print(f"   - Legitimate cases: {len(self.labels) - fraud_count}")
 
         # Normalize label keys to strings
         self.labels = {str(k): v for k, v in self.labels.items()}
 
-        # If labels are incomplete, generate synthetic labels for demonstration
+        # Filter transactions to ONLY those with labels (training set)
+        # Unlabeled transactions are reserved for prediction/test set
         if self.transactions is not None and len(self.labels) < len(self.transactions):
-            print(f"⚠️  Warning: Only {len(self.labels)} labels for {len(self.transactions)} transactions")
-            print("   Generating synthetic labels for demonstration (5% fraud rate)")
-            np.random.seed(42)
-            tx_ids = self.transactions["id"].astype(str).values
-            for tx_id in tx_ids:
-                if tx_id not in self.labels:
-                    self.labels[tx_id] = "Yes" if np.random.random() < 0.05 else "No"
+            print(f"⚠️  Dataset split:")
+            print(f"   - Labeled transactions (training): {len(self.labels)}")
+            print(f"   - Unlabeled transactions (prediction): {len(self.transactions) - len(self.labels)}")
+            print(f"   Filtering to labeled transactions only...")
+            
+            tx_ids_str = self.transactions["id"].astype(str)
+            labeled_mask = tx_ids_str.isin(self.labels.keys())
+            self.transactions = self.transactions[labeled_mask].reset_index(drop=True)
+            print(f"   ✓ Filtered to {len(self.transactions)} labeled transactions")
 
         cards_path = self.data_dir / "cards_data.csv"
         if cards_path.exists():
@@ -570,7 +642,10 @@ class FraudDataPreprocessor:
 
 
 def main():
-    data_dir = Path("/Users/sofijadimitrijevic/Downloads/computingvictor:transactions-fraud-datasets")
+    # Download dataset via curl if not already present
+    download_dir = Path.home() / "Downloads"
+    data_dir = FraudDataPreprocessor.download_dataset_via_curl(download_dir)
+    
     output_dir = Path("/Users/sofijadimitrijevic/csc480/480-ai-finance/processed_data")
 
     preprocessor = FraudDataPreprocessor(data_dir)
